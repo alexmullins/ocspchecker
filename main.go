@@ -5,8 +5,7 @@
 //      a. Get issuer and server x509 certs
 //      b. Get OCSP url from the server's x509 Certificate.OCSPServer
 //      c. Use ocsp.CreateRequest() to create a request
-//      d. url-base64 encode the request and make a GET request to
-//          https://{url}/{encoded-request}
+//      d. Send POST request to {url} with raw ocsp request
 package main
 
 import (
