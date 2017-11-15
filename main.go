@@ -12,18 +12,83 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
 	"flag"
+	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ocsp"
 )
 
 var (
-	destURL = flag.String("url", "", "url to check")
+	destURL  = flag.String("url", "", "url to check")
+	certPath = flag.String("pem", "", "pem to check")
+
+	authorityInfoAccess = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 1}
+	aiaOCSP             = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1}
+	aiaIssuer           = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 2}
 )
+
+func decodeAIA(ext []byte) (string, error) {
+	var seq asn1.RawValue
+	rest, err := asn1.Unmarshal(ext, &seq)
+	if err != nil {
+		return "", fmt.Errorf("Error unmarshaling %s", err)
+	} else if len(rest) != 0 {
+		return "", fmt.Errorf("x509: trailing data after X.509 extension")
+	}
+
+	if !seq.IsCompound || seq.Tag != 16 || seq.Class != 0 {
+		return "", asn1.StructuralError{Msg: "bad SAN sequence"}
+	}
+
+	rest = seq.Bytes
+
+	for len(rest) > 0 {
+		var inside asn1.RawValue
+		rest, err = asn1.Unmarshal(rest, &inside)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		}
+
+		if !inside.IsCompound || inside.Tag != 16 || inside.Class != 0 {
+			return "", asn1.StructuralError{Msg: "bad SAN sequence"}
+		}
+
+		var oidValue asn1.ObjectIdentifier
+		body, err := asn1.Unmarshal(inside.Bytes, &oidValue)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		}
+
+		var extensionData asn1.RawValue
+		rest, err := asn1.Unmarshal(body, &extensionData)
+		if err != nil {
+			return "", fmt.Errorf("Error unmarshaling %s", err)
+		} else if len(rest) != 0 {
+			return "", fmt.Errorf("x509: trailing data after AIA extension")
+		}
+
+		if oidValue.Equal(aiaIssuer) {
+			switch extensionData.Tag {
+			case 6:
+				return string(extensionData.Bytes), nil
+			default:
+				return "", fmt.Errorf("Unknown type for AIA Issuer extension: %+v", extensionData)
+			}
+		}
+
+	}
+
+	// No AIA Issuer extension values
+	return "", nil
+}
 
 func grabIssuerCert(connState *tls.ConnectionState) *x509.Certificate {
 	return connState.VerifiedChains[0][1]
@@ -33,39 +98,38 @@ func grabServerCert(connState *tls.ConnectionState) *x509.Certificate {
 	return connState.VerifiedChains[0][0]
 }
 
-func manualCheck(connState *tls.ConnectionState) {
-	server := grabServerCert(connState)
-	issuer := grabIssuerCert(connState)
-	ocspURL := server.OCSPServer[0]
-	log.Printf("Server: %v\n", server.Subject.CommonName)
+func manualCheck(ee *x509.Certificate, issuer *x509.Certificate) error {
+	ocspURL := ee.OCSPServer[0]
+	log.Printf("Server: %v\n", ee.Subject.CommonName)
 	log.Printf("Issuer: %v\n", issuer.Subject.CommonName)
 	log.Printf("OCSP URL: %v\n", ocspURL)
 
-	ocspReq, err := ocsp.CreateRequest(server, issuer, nil)
+	ocspReq, err := ocsp.CreateRequest(ee, issuer, nil)
 	if err != nil {
-		log.Fatalln("error creating ocsp request: ", err)
+		return fmt.Errorf("error creating ocsp request: %v", err)
 	}
 	body := bytes.NewReader(ocspReq)
 	req, err := http.NewRequest("POST", ocspURL, body)
 	if err != nil {
-		log.Fatalln("error creating http post request: ", err)
+		return fmt.Errorf("error creating http post request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/ocsp-request")
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Fatalln("error sending post request: ", err)
+		return fmt.Errorf("error sending post request: %v", err)
 	}
+
 	defer resp.Body.Close()
 	buf := new(bytes.Buffer)
 	io.Copy(buf, resp.Body)
-	parseResponse(buf.Bytes(), issuer)
+	return parseResponse(buf.Bytes(), issuer)
 }
 
-func parseResponse(response []byte, issuer *x509.Certificate) {
+func parseResponse(response []byte, issuer *x509.Certificate) error {
 	resp, err := ocsp.ParseResponse(response, issuer)
 	if err != nil {
-		log.Fatalln("error parsing response: ", err)
+		return fmt.Errorf("error parsing response: %v", err)
 	}
 	if resp.Status == ocsp.Good {
 		log.Println("Certificate Status Good.")
@@ -74,43 +138,122 @@ func parseResponse(response []byte, issuer *x509.Certificate) {
 	} else {
 		log.Println("Certificate Status Revoked")
 	}
+	return nil
 }
 
-func stapledCheck(connState *tls.ConnectionState) {
-	server := grabServerCert(connState)
-	issuer := grabIssuerCert(connState)
-	log.Printf("Server: %v\n", server.Subject.CommonName)
+func stapledCheck(ee *x509.Certificate, issuer *x509.Certificate, staple []byte) error {
+	log.Printf("Server: %v\n", ee.Subject.CommonName)
 	log.Printf("Issuer: %v\n", issuer.Subject.CommonName)
 
-	parseResponse(connState.OCSPResponse, issuer)
+	return parseResponse(staple, issuer)
+}
+
+func processURL() error {
+	resp, err := http.Get(*destURL)
+	if err != nil {
+		return err
+	}
+	connState := resp.TLS
+	if connState == nil {
+		return fmt.Errorf("no connection state")
+	}
+
+	server := grabServerCert(connState)
+	issuer := grabIssuerCert(connState)
+	staple := connState.OCSPResponse
+
+	if staple == nil {
+		// manually check revocation
+		log.Println("manual check")
+		return manualCheck(server, issuer)
+	}
+
+	// parse the ocsp response
+	log.Println("stapled check")
+	return stapledCheck(server, issuer, staple)
+}
+
+func processFile() error {
+	certPEM, err := ioutil.ReadFile(*certPath)
+	if err != nil {
+		log.Fatalf("Error reading file: %v", err)
+	}
+
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		log.Fatalf("failed to parse certificate PEM")
+	}
+
+	endEntity, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Fatalf("failed to parse certificate: %v\n", err)
+	}
+
+	var aiaURL *string
+
+	for _, ext := range endEntity.Extensions {
+		if ext.Id.Equal(authorityInfoAccess) {
+			url, err := decodeAIA(ext.Value)
+			if err != nil {
+				return err
+			}
+
+			if len(url) > 0 {
+				aiaURL = &url
+			}
+		}
+	}
+
+	if aiaURL == nil {
+		return fmt.Errorf("No AIA url, and previous error was %s", err)
+	}
+
+	log.Printf("Fetching issuer certificate from %s", *aiaURL)
+
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
+
+	response, err := client.Get(*aiaURL)
+	if err != nil {
+		return err
+	}
+
+	defer response.Body.Close()
+	certBytes, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return err
+	}
+
+	fetchedCert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return err
+	}
+
+	return manualCheck(endEntity, fetchedCert)
 }
 
 func main() {
 	flag.Parse()
 
-	if *destURL == "" {
-		log.Fatalln("must provide a url")
-	}
-	if !strings.HasPrefix(*destURL, "https") {
-		log.Fatalln("must provide a https url")
+	if *certPath == "" && *destURL == "" {
+		log.Fatalf("must provide a url or cert\n")
 	}
 
-	resp, err := http.Get(*destURL)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	cs := resp.TLS
-	if cs == nil {
-		log.Fatalln("no connection state")
+	if *destURL != "" {
+		if !strings.HasPrefix(*destURL, "https") {
+			log.Fatalf("must provide a https url\n")
+		}
+		err := processURL()
+		if err != nil {
+			log.Fatalf("Error processing URL: %v\n", err)
+		}
 	}
 
-	if cs.OCSPResponse == nil {
-		// manually check revocation
-		log.Println("manual check")
-		manualCheck(cs)
-	} else {
-		// parse the ocsp response
-		log.Println("stapled check")
-		stapledCheck(cs)
+	if *certPath != "" {
+		err := processFile()
+		if err != nil {
+			log.Fatalf("Error processing file: %v\n", err)
+		}
 	}
 }
