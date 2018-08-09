@@ -35,6 +35,35 @@ var (
 	aiaIssuer           = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 2}
 )
 
+type RevocationReason int
+
+func (r RevocationReason) String() string {
+	switch int(r) {
+	case ocsp.Unspecified:
+		return "Unspecified"
+	case ocsp.KeyCompromise:
+		return "KeyCompromise"
+	case ocsp.CACompromise:
+		return "CACompromise"
+	case ocsp.AffiliationChanged:
+		return "AffiliationChanged"
+	case ocsp.Superseded:
+		return "Superseded"
+	case ocsp.CessationOfOperation:
+		return "CessationOfOperation"
+	case ocsp.CertificateHold:
+		return "CertificateHold"
+	case ocsp.RemoveFromCRL:
+		return "RemoveFromCRL"
+	case ocsp.PrivilegeWithdrawn:
+		return "PrivilegeWithdrawn"
+	case ocsp.AACompromise:
+		return "AACompromise"
+	default:
+		return "Unknown"
+	}
+}
+
 func decodeAIA(ext []byte) (string, error) {
 	var seq asn1.RawValue
 	rest, err := asn1.Unmarshal(ext, &seq)
@@ -133,10 +162,20 @@ func parseResponse(response []byte, issuer *x509.Certificate) error {
 	}
 	if resp.Status == ocsp.Good {
 		log.Println("Certificate Status Good.")
-	} else if resp.Status == ocsp.Unknown {
-		log.Println("Certificate Status Unknown")
+	} else if resp.Status == ocsp.Revoked {
+		log.Printf("Certificate Status Revoked at %v for reason %v", resp.RevokedAt.Local(), RevocationReason(resp.RevocationReason))
 	} else {
-		log.Println("Certificate Status Revoked")
+		log.Println("Certificate Status Unknown")
+	}
+	log.Printf("produced at: %v, this update: %v, next update: %v", resp.ProducedAt.Local(), resp.ThisUpdate.Local(), resp.NextUpdate.Local())
+		if time.Now().Before(resp.ProducedAt) {
+	log.Println("Warning: Current time is before response ProducedAt")
+	}
+	if time.Now().Before(resp.ThisUpdate) {
+	log.Println("Warning: Current time is before response ThisUpdate")
+	}
+	if time.Now().After(resp.NextUpdate) {
+	log.Println("Warning: Current time is after response NextUpdate")
 	}
 	return nil
 }
